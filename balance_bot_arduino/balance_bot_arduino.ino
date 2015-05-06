@@ -1,188 +1,175 @@
 #include "Wire.h"
-#include "SPI.h"  
+#include "SPI.h"
 #include "Mirf.h"
 #include "nRF24L01.h"
 #include "MirfHardwareSpiDriver.h"
 #include "I2Cdev.h"
 #include "MPU6050.h"
 
-MPU6050 accelgyro;
-int16_t ax, ay, az;
-int16_t gx, gy, gz;
+//#include "general_conf.h"
+// I/O pins
+#define TN1 2
+#define TN2 3
 
+#define TN3 7
+#define TN4 8
+
+#define ENA 5 //timer1
+#define ENB 6 //timer1
+
+#define SERVO 9 //timer0
+
+//Generals
+#define pi 3.14159 
+#define DEBUG_MODE 1 // 0:false or 1:true
+
+// System Parameters
 #define Gry_offset 273.0
 #define Gyr_Gain 0.00763358
-#define Angle_offset -1.9
+#define Angle_offset -1 //2.7
 #define RMotor_offset 19
 #define LMotor_offset 20
-#define pi 3.14159 
 
-long data;
-int x, y;
-float kp, ki, kd; 
-float r_angle, f_angle, omega;
-float Turn_Speed = 0, Turn_Speed_K = 0;
-float Run_Speed = 0, Run_Speed_K = 0, Run_Speed_T = 0;
-float LOutput,ROutput;
+#include <Servo.h> 
+Servo myservo;
+int servo_pos = 0;
 
-unsigned long preTime = 0;
-float SampleTime = 0.08;
-unsigned long lastTime;
-float Input, Output;
+// Sensors & Filter
+MPU6050 accelgyro;
+float f_angle=0;
+
+// Control Loop
+float kp = 30; //30;
+float ki = 0.08 ;//0.09;
+float kd = 700 ;//700;
 float errSum, dErr, error, lastErr;
-int timeChange; 
+double pid_input, pid_output;
 
-int TN1=3;
-int TN2=5;
-int ENA=9;
+double pid_setpoint=0.0;
+//double pid_setpoint=2.0;
 
-int TN3=6;
-int TN4=7;
-int ENB=10;
 
-int SERVO=11;
+// Loop Frequencies Control
+unsigned long start_time;
+unsigned long prev_control_ms = 0;
+unsigned long control_period_ms = 12; //200 Hz
+unsigned long prev_sensor_ms = 0;
+unsigned long sensor_period_ms = 12; //200 Hz
+unsigned long prev_remote_ms = 0;
+unsigned long remote_period_ms = 200; //5 Hz
 
 void setup() {
   Wire.begin();
   accelgyro.initialize();
+
+  Serial.begin(115200);
+  Serial.setTimeout(1);
+  
   pinMode(TN1,OUTPUT);
   pinMode(TN2,OUTPUT);
   pinMode(TN3,OUTPUT);
   pinMode(TN4,OUTPUT);
   pinMode(ENA,OUTPUT);
   pinMode(ENB,OUTPUT);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  myservo.attach(SERVO);
   
-//  myservo.attach(SERVO);
-  
-  Mirf.spi = &MirfHardwareSpi;   
-  Mirf.init();
-  Mirf.setRADDR((byte *)"serv1");
-  Mirf.payload = sizeof(long);
-  Mirf.config();
-  Serial.begin(115200);
-  Serial.setTimeout(1);
-  
-  kp = 30;
-  ki = 0.09;
-  kd = 700;
+  //Loop Frequencies
+  prev_control_ms = millis();
+  prev_sensor_ms  = millis();
+  prev_remote_ms  = millis();
 }
 
-void read_pid_config(){
-  if (Serial.available() > 3) {
-    kp = Serial.parseFloat();
-    Serial.print("Set kp: ");
-    Serial.print(kp, DEC);
-    ki = Serial.parseFloat();
-    Serial.print("  ki: ");
-    Serial.print(ki, DEC);
-    kd = Serial.parseFloat();
-    Serial.print(" kd: ");
-    Serial.println(kd, DEC);
-  }
-}
-
-void loop() {
-//  read_pid_config();
-//  if(Serial.available()>0){
-//    int val = Serial.parseInt();
-//    myservo.write(val);
-//  }
-  Recive();
+void loop()
+{
+  unsigned long current_millis = millis();
+  unsigned long new_millis = current_millis;
   
-  accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-  r_angle = (atan2(ay, az) * 180 / pi + Angle_offset);
-  omega =  Gyr_Gain * (gx +  Gry_offset);  Serial.print("  omega="); Serial.print(omega);
-  Serial.print("  r_angle="); Serial.print(r_angle);
+  //Read & Filter sensor data
+  if((millis() - prev_sensor_ms) >= sensor_period_ms) {
+    sensor_loop();
+  }
 
-  if (abs(r_angle)<45){
-    myPID();
-    PWMControl();
+  //Control
+  if((millis() - prev_control_ms) >= control_period_ms) {
+    if(abs(f_angle)<=45){
+//      sensor_loop();
+      control_loop();
+    } else{
+      analogWrite(ENA, 0);
+      analogWrite(ENB, 0);
+    }
   }
-  else{
-    analogWrite(ENA, 0);
-    analogWrite(ENB, 0);
+  
+  //Read Joystick command/serial command
+  if((millis() - prev_remote_ms) >= remote_period_ms) {
+    prev_remote_ms = millis();
+    remote_loop();
   }
-  Serial.println();
 }
 
-void Recive(){
-  if(!Mirf.isSending() && Mirf.dataReady()){
-    Mirf.getData((byte *)&data);
-    Mirf.rxFifoEmpty();
-    
-    x = data >> 16;
-    y = data & 0x0000ffff;
-    Serial.print("  x="); Serial.print(x);
-    Serial.print("  y="); Serial.print(y);
-    
-    if(x >= 520){
-      Run_Speed_K = map(x, 520, 1023, 0, 100);
-      Run_Speed_K = Run_Speed_K / 50;
-//      Run_Speed = Run_Speed + Run_Speed_K;
-      Run_Speed = Run_Speed_K;
-    }
-    else if(x <= 480){
-      Run_Speed_K = map(x, 480, 0, 0, -100);
-      Run_Speed_K = Run_Speed_K / 50;
-//      Run_Speed = Run_Speed + Run_Speed_K;
-      Run_Speed = Run_Speed_K;
-    }
-    else{
-      Run_Speed_K = 0;
-    }
-    if(y >= 520){
-      Turn_Speed = map(y, 520, 1023, 0, 20);
-    }
-    else if(y <= 480){
-      Turn_Speed = map(y,480,0,0,-20);
-    }
-    else{
-      Turn_Speed = 0;
-    }
-//    Turn_Speed = Turn_Speed/10;
-    Turn_Speed = 0;
-    Run_Speed =0;
-  }
-  else{
-    x = y = 500;
-  }
-  Serial.print("  run_speed="); Serial.print(Run_Speed);
-  Serial.print("  turn_speed="); Serial.print(Turn_Speed);
-}
+void control_loop(){
+  start_time = millis();
+  float dt = (start_time-prev_control_ms);
+  //PID
+  pid_input = f_angle;
+  error = pid_input-pid_setpoint;
+  errSum += error * dt;
+  //limit errSum:
+  errSum = min(30,errSum);
+  errSum = max(-30,errSum);
+  
+  dErr = (error - lastErr) / dt;
+  pid_output = kp * error + ki * errSum + kd * dErr;
+  lastErr = error;
 
-void myPID(){
-//  kp = analogRead(A0)*0.1;  Serial.print("  kp=");Serial.print(kp);
-//  kd = analogRead(A2)*1.0;  Serial.print("  kd=");Serial.print(kd);
-  //ki = analogRead(A3)*0.001;  Serial.print("  ki=");Serial.print(ki);
+  float motor_cmd = pid_output;
 
+  //send command
+  send_motor_cmd(motor_cmd,motor_cmd);
+  
+  #ifdef DEBUG_MODE
+  Serial.print("  motor_cmd="); Serial.print(motor_cmd);
+  Serial.print("  dt_control="); Serial.print(dt);
   Serial.print("  kp=");Serial.print(kp);
   Serial.print("  kd=");Serial.print(kd);
   Serial.print("  ki=");Serial.print(ki);
-   
-  unsigned long now = millis();
-  float dt = (now - preTime) / 1000.0;
-  preTime = now;
-  float K = 0.8;
-  float A = K / (K + dt);
-  f_angle = A * (f_angle + omega * dt) + (1 - A) * r_angle;  Serial.print("  f_angle=");Serial.print(f_angle);
-  
-  timeChange = (now - lastTime);
-  if(timeChange >= SampleTime){
-    Input = f_angle;
-    error = Input;
-    errSum += error * timeChange;
-    dErr = (error - lastErr) / timeChange;
-    Output = kp * error + ki * errSum + kd * dErr;
-    LOutput = Output + Run_Speed + Turn_Speed;  Serial.print("  LOutput=");Serial.print(LOutput);
-    ROutput = Output + Run_Speed - Turn_Speed;  Serial.print("  ROutput=");Serial.print(ROutput);
-//    LOutput = Output;  Serial.print("  LOutput=");Serial.print(LOutput);
-//    ROutput = Output;  Serial.print("  ROutput=");Serial.print(ROutput);    
-    lastErr = error;
-    lastTime = now;
-  }
+  Serial.print("  errSum=");Serial.print(errSum);
+  Serial.println();
+  #endif
+  prev_control_ms = start_time;
 }
 
-void PWMControl(){
+void sensor_loop(){
+  start_time = millis();
+
+  //Read Accel & Gyro
+  int16_t ax, ay, az, gx, gy, gz;
+  accelgyro.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  float r_angle = (atan2(ay, az) * 180 / pi + Angle_offset);
+  float omega =  Gyr_Gain * (gx +  Gry_offset);
+  
+  //Filter
+  float dt = (start_time-prev_sensor_ms)/1000.0;//sec
+  float K = 0.8;
+  float A = K / (K + dt);
+  f_angle = A * (f_angle + omega * dt) + (1 - A) * r_angle;
+
+  #ifdef DEBUG_MODE
+  Serial.print("  omega="); Serial.print(omega);
+  Serial.print("  r_angle="); Serial.print(r_angle);
+  Serial.print("  f_angle=");Serial.print(f_angle);
+  Serial.print("  dt_sensor="); Serial.print(start_time-prev_sensor_ms);
+//  Serial.println();
+  #endif
+  prev_sensor_ms = start_time;    
+  
+}
+
+//--------------------------------
+//    SUPPORTING FUNCTIONS
+void send_motor_cmd(float LOutput, float ROutput){
   if(LOutput > 0){
     digitalWrite(TN1, HIGH);
     digitalWrite(TN2, LOW);
@@ -207,8 +194,34 @@ void PWMControl(){
     digitalWrite(TN3, HIGH);
     digitalWrite(TN4, HIGH);
   }
-    analogWrite(ENA, min(255, abs(LOutput) + LMotor_offset));
-    analogWrite(ENB, min(255, abs(ROutput) + RMotor_offset));
+  analogWrite(ENA, min(255, abs(LOutput) + LMotor_offset));
+  analogWrite(ENB, min(255, abs(ROutput) + RMotor_offset));
 }
 
+void read_pid_config(){
+  if (Serial.available() > 3) {
+    kp = Serial.parseFloat();
+    Serial.print("Set kp: ");
+    Serial.print(kp, DEC);
+    ki = Serial.parseFloat();
+    Serial.print("  ki: ");
+    Serial.print(ki, DEC);
+    kd = Serial.parseFloat();
+    Serial.print(" kd: ");
+    Serial.println(kd, DEC);
+  }
+}
 
+void read_servo_config(){
+  if (Serial.available() > 0) {
+    servo_pos = Serial.parseFloat();
+    Serial.print(" servo: ");
+    Serial.println(servo_pos, DEC);
+    myservo.write(servo_pos);
+  }
+}
+
+void remote_loop(){
+//  read_pid_config();
+  read_servo_config();
+}
